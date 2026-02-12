@@ -44,14 +44,23 @@ def mqtt_send(status):
     payload = {"state": status}
     client.publish(MQTT_TOPIC, json.dumps(payload))
 
-# mqtt_connect()
+mqtt_connect()
 
 def generate_frames():
     cap = cv2.VideoCapture(CAMERA_PORT)
+    # --- จุดที่ 1: ลดความละเอียดกล้องตั้งแต่ต้นทาง ---
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
     time.sleep(1)
     last_status = None
     last_seen_time = 0
     off_delay = 5
+    
+    # ตัวแปรสำหรับคุมความลื่น
+    frame_count = 0
+    person_count = 0
+    target_status = "OFF"
 
     while cap.isOpened():
         success, frame = cap.read()
@@ -61,32 +70,38 @@ def generate_frames():
             cap = cv2.VideoCapture(CAMERA_PORT)
             continue
 
-        img = cv2.resize(frame, (640, 640))
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))
-        img = np.expand_dims(img, axis=0)
+        frame_count += 1
+        # --- จุดที่ 2: ข้ามเฟรม รัน AI ทุกๆ 6 เฟรมพอ (ประมาณ 0.2 วินาทีครั้ง) ---
+        if frame_count % 6 == 0:
+            img = cv2.resize(frame, (640, 640))
+            img = img.astype(np.float32) / 255.0
+            img = np.transpose(img, (2, 0, 1))
+            img = np.expand_dims(img, axis=0)
 
-        outputs = session.run(None, {input_name: img})
-        preds = np.squeeze(outputs).T
-        scores = preds[:, 4:]
-        max_scores = np.max(scores, axis=1)
-        person_count = np.sum(max_scores > 0.4) 
+            outputs = session.run(None, {input_name: img})
+            preds = np.squeeze(outputs).T
+            scores = preds[:, 4:]
+            max_scores = np.max(scores, axis=1)
+            person_count = np.sum(max_scores > 0.4) 
 
-        current_time = time.time()
-        if person_count > 0:
-            last_seen_time = current_time
-            target_status = "ON"
-        else:
-            target_status = "OFF" if (current_time - last_seen_time > off_delay) else "ON"
+            current_time = time.time()
+            if person_count > 0:
+                last_seen_time = current_time
+                target_status = "ON"
+            else:
+                target_status = "OFF" if (current_time - last_seen_time > off_delay) else "ON"
 
-        if target_status != last_status:
-            # mqtt_send(target_status)
-            last_status = target_status
+            if target_status != last_status:
+                mqtt_send(target_status)
+                last_status = target_status
+            
+            frame_count = 0 # reset ตัวนับ
 
+        # วาดข้อความ (วาดทุกเฟรมเพื่อให้ตัวเลขไม่กระพริบ)
         cv2.putText(frame, f"People: {person_count}", (20, 50), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-        cv2.putText(frame, f"Status: {target_status}", (20, 100), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv2.putText(frame, f"Status: {target_status}", (20, 90), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
         ret, buffer = cv2.imencode('.jpg', frame)
         if not ret: continue
