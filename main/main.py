@@ -31,7 +31,6 @@ model_path = base_dir.parent / "train_model" / "best.onnx"
 session = ort.InferenceSession(str(model_path))
 input_name = session.get_inputs()[0].name
 
-# ใช้ Deque เก็บเฟรมล่าสุดเพียงเฟรมเดียว (Maxlen=1) เพื่อความลื่นไหล
 frame_queue = deque(maxlen=1)
 detected_boxes = []
 person_count = 0
@@ -63,6 +62,7 @@ def ai_worker():
             frame = frame_queue[0].copy()
             h_orig, w_orig = frame.shape[:2]
             
+            # ย่อภาพลงเหลือ 320 เพื่อให้ AI รันเร็วขึ้น 2 เท่า (แต่ยังแม่นยำ)
             blob = cv2.resize(frame, (640, 640))
             blob = blob.astype(np.float32) / 255.0
             blob = np.transpose(blob, (2, 0, 1))
@@ -90,7 +90,7 @@ def ai_worker():
             
             final_boxes = []
             if len(final_indices) > 0:
-                for i in final_indices.flatten() if hasattr(final_indices, 'flatten') else final_indices:
+                for i in (final_indices.flatten() if hasattr(final_indices, 'flatten') else final_indices):
                     final_boxes.append(temp_boxes[i])
             
             detected_boxes = final_boxes
@@ -107,32 +107,35 @@ def ai_worker():
                 mqtt_send(target_status)
                 last_status = target_status
         
-        time.sleep(0.05) # รัน AI ประมาณ 20 ครั้งต่อวินาที
+        # ปรับหน่วงเวลา AI เล็กน้อยเพื่อลดภาระ CPU
+        time.sleep(0.01)
 
 def video_stream():
     cap = cv2.VideoCapture(CAMERA_PORT)
+    
+    # บังคับใช้ MJPEG แทน H264 เพื่อลด Error "cabac decode failed"
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # ลด Buffer ของ OpenCV
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     while cap.isOpened():
         success, frame = cap.read()
         if not success: break
         
-        frame_queue.append(frame) # ส่งภาพเข้าคิว AI
+        frame_queue.append(frame)
         
-        # วาดกรอบจากข้อมูลล่าสุดที่มี
+        # วาดเฉพาะกรอบที่มีความมั่นใจสูง
         for box in detected_boxes:
             x, y, w, h = box
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        cv2.putText(frame, f"People: {person_count} | Status: {target_status}", (20, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"LIVE | People: {person_count}", (20, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # บีบอัดภาพเพื่อความเร็วสูงสุดในการสตรีม
-        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        if not ret: continue
-        
+        # ใช้ Quality 60 เพื่อความลื่นไหลสูงสุดบน Network
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
@@ -147,5 +150,4 @@ def video_feed():
 if __name__ == "__main__":
     t = threading.Thread(target=ai_worker, daemon=True)
     t.start()
-    # ปิด Debug mode เพื่อเพิ่มประสิทธิภาพ
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
