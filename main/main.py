@@ -2,13 +2,13 @@ import cv2
 import json
 import time 
 import os 
+import numpy as np
 import paho.mqtt.client as mqtt
 from flask import Flask, render_template, Response
-from ultralytics import YOLO
 from dotenv import load_dotenv
 from pathlib import Path
+import onnxruntime as ort
 
-# --- Load Environment ---
 base_dir = Path(__file__).resolve().parent
 env_path = base_dir / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -18,37 +18,31 @@ MQTT_PORT = int(os.getenv("MQTT_PORT"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC")
 MQTT_USER = os.getenv("MQTT_USER")
 MQTT_PASS = os.getenv("MQTT_PASS")
-CAMERA_PORT = os.getenv("CAMERA_PORT")
+CAMERA_PORT = os.getenv("CAMERA_PORT", 0)
 
-if CAMERA_PORT and CAMERA_PORT.isdigit():
+if isinstance(CAMERA_PORT, str) and CAMERA_PORT.isdigit():
     CAMERA_PORT = int(CAMERA_PORT)
 
 app = Flask(__name__)
 model_path = base_dir.parent / "train_model" / "best.onnx"
 
-if not model_path.exists():
-    model_path = base_dir.parent / "train_model" / "best.pt"
+session = ort.InferenceSession(str(model_path))
+input_name = session.get_inputs()[0].name
 
-print(f"Loading model from: {model_path}")
-model = YOLO(str(model_path))
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 
-# --- MQTT Setup ---
-# client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+def mqtt_connect():
+    try:
+        if MQTT_USER and MQTT_PASS:
+            client.username_pw_set(MQTT_USER, MQTT_PASS)
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.loop_start()
+    except Exception as e:
+        print(f"MQTT Error: {e}")
 
-# def mqtt_connect():
-#     try:
-#         if MQTT_USER and MQTT_PASS:
-#             client.username_pw_set(MQTT_USER, MQTT_PASS)
-#         client.connect(MQTT_BROKER, MQTT_PORT, 60)
-#         client.loop_start()
-#         print("Connected to MQTT Broker")
-#     except Exception as e:
-#         print(f"MQTT Connection Error: {e}")
-
-# def mqtt_send(status):
-#     payload = {"state": status}
-#     client.publish(MQTT_TOPIC, json.dumps(payload))
-#     print(f"Sent to MQTT: {status}")
+def mqtt_send(status):
+    payload = {"state": status}
+    client.publish(MQTT_TOPIC, json.dumps(payload))
 
 # mqtt_connect()
 
@@ -67,44 +61,38 @@ def generate_frames():
             cap = cv2.VideoCapture(CAMERA_PORT)
             continue
 
-        results = model.predict(frame, classes=0, conf=0.4, verbose=False)
-        person_count = len(results[0].boxes)
-        
+        img = cv2.resize(frame, (640, 640))
+        img = img.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))
+        img = np.expand_dims(img, axis=0)
 
-        annotated_frame = results[0].plot()
-
+        outputs = session.run(None, {input_name: img})
+        preds = np.squeeze(outputs).T
+        scores = preds[:, 4:]
+        max_scores = np.max(scores, axis=1)
+        person_count = np.sum(max_scores > 0.4) 
 
         current_time = time.time()
         if person_count > 0:
             last_seen_time = current_time
             target_status = "ON"
         else:
-            if current_time - last_seen_time > off_delay:
-                target_status = "OFF"
-            else:
-                target_status = "ON"
+            target_status = "OFF" if (current_time - last_seen_time > off_delay) else "ON"
 
+        if target_status != last_status:
+            # mqtt_send(target_status)
+            last_status = target_status
 
-        # nonlocal last_status
-        # if target_status != last_status:
-        #     mqtt_send(target_status)
-        #     last_status = target_status
+        cv2.putText(frame, f"People: {person_count}", (20, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+        cv2.putText(frame, f"Status: {target_status}", (20, 100), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
 
-
-        cv2.putText(annotated_frame, f"People Count: {person_count}", (20, 50), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.putText(annotated_frame, f"Status: {target_status}", (20, 90), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-
-
-        ret, buffer = cv2.imencode('.jpg', annotated_frame)
-        if not ret:
-            continue
-        frame_bytes = buffer.tobytes()
+        ret, buffer = cv2.imencode('.jpg', frame)
+        if not ret: continue
         
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
+               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
 @app.route('/')
 def index():
