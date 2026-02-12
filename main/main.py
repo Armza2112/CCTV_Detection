@@ -4,12 +4,11 @@ import time
 import os 
 import numpy as np
 import paho.mqtt.client as mqtt
-from flask import Flask, render_template, Response
+from flask import Flask, render_template, Response, send_file
 from dotenv import load_dotenv
 from pathlib import Path
 import onnxruntime as ort
 import threading
-from collections import deque
 
 base_dir = Path(__file__).resolve().parent
 env_path = base_dir / ".env"
@@ -31,13 +30,13 @@ model_path = base_dir.parent / "train_model" / "best.onnx"
 session = ort.InferenceSession(str(model_path))
 input_name = session.get_inputs()[0].name
 
-frame_queue = deque(maxlen=1)
-detected_boxes = []
+# Global Variables
+last_frame_path = "latest_detect.jpg"
 person_count = 0
 target_status = "OFF"
+CHECK_INTERVAL = 60 # วินาที (เปลี่ยนเป็น 60 คือ 1 นาที)
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-
 def mqtt_connect():
     try:
         if MQTT_USER and MQTT_PASS:
@@ -51,18 +50,15 @@ def mqtt_send(status):
 
 mqtt_connect()
 
-def ai_worker():
-    global detected_boxes, person_count, target_status
-    last_status = None
-    last_seen_time = 0
-    off_delay = 5
-
+def detection_job():
+    global person_count, target_status
+    cap = cv2.VideoCapture(CAMERA_PORT)
+    
     while True:
-        if len(frame_queue) > 0:
-            frame = frame_queue[0].copy()
+        success, frame = cap.read()
+        if success:
+            # ทำ AI Detection
             h_orig, w_orig = frame.shape[:2]
-            
-            # ย่อภาพลงเหลือ 320 เพื่อให้ AI รันเร็วขึ้น 2 เท่า (แต่ยังแม่นยำ)
             blob = cv2.resize(frame, (640, 640))
             blob = blob.astype(np.float32) / 255.0
             blob = np.transpose(blob, (2, 0, 1))
@@ -73,11 +69,10 @@ def ai_worker():
             
             temp_boxes = []
             confidences = []
-            scores = preds[:, 4:]
-            max_scores = np.max(scores, axis=1)
-            
-            indices_raw = np.where(max_scores > 0.4)[0]
-            for i in indices_raw:
+            max_scores = np.max(preds[:, 4:], axis=1)
+            indices = np.where(max_scores > 0.4)[0]
+
+            for i in indices:
                 xc, yc, w, h = preds[i][:4]
                 x1 = int((xc - w/2) * (w_orig / 640))
                 y1 = int((yc - h/2) * (h_orig / 640))
@@ -85,69 +80,51 @@ def ai_worker():
                 nh = int(h * (h_orig / 640))
                 temp_boxes.append([x1, y1, nw, nh])
                 confidences.append(float(max_scores[i]))
-            
+
             final_indices = cv2.dnn.NMSBoxes(temp_boxes, confidences, 0.4, 0.5)
-            
-            final_boxes = []
-            if len(final_indices) > 0:
-                for i in (final_indices.flatten() if hasattr(final_indices, 'flatten') else final_indices):
-                    final_boxes.append(temp_boxes[i])
-            
-            detected_boxes = final_boxes
-            person_count = len(final_boxes)
+            person_count = len(final_indices)
 
-            curr_time = time.time()
-            if person_count > 0:
-                last_seen_time = curr_time
-                target_status = "ON"
-            else:
-                target_status = "OFF" if (curr_time - last_seen_time > off_delay) else "ON"
+            # วาดกรอบและบันทึกภาพลงไฟล์
+            for i in (final_indices.flatten() if len(final_indices) > 0 else []):
+                x, y, w, h = temp_boxes[i]
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            
+            curr_status = "ON" if person_count > 0 else "OFF"
+            cv2.putText(frame, f"Detected: {person_count} | {time.ctime()}", (20, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            cv2.imwrite(last_frame_path, frame)
 
-            if target_status != last_status:
+            # ส่ง MQTT ถ้าสถานะเปลี่ยน
+            if curr_status != target_status:
+                target_status = curr_status
                 mqtt_send(target_status)
-                last_status = target_status
-        
-        # ปรับหน่วงเวลา AI เล็กน้อยเพื่อลดภาระ CPU
-        time.sleep(0.01)
 
-def video_stream():
-    cap = cv2.VideoCapture(CAMERA_PORT)
-    
-    # บังคับใช้ MJPEG แทน H264 เพื่อลด Error "cabac decode failed"
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            print(f"[{time.ctime()}] Check Done: {person_count} found.")
 
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success: break
-        
-        frame_queue.append(frame)
-        
-        # วาดเฉพาะกรอบที่มีความมั่นใจสูง
-        for box in detected_boxes:
-            x, y, w, h = box
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-        cv2.putText(frame, f"LIVE | People: {person_count}", (20, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        # ใช้ Quality 60 เพื่อความลื่นไหลสูงสุดบน Network
-        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        # พักเครื่องตามเวลาที่กำหนด
+        time.sleep(CHECK_INTERVAL)
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    # ส่งหน้าเว็บที่สั่งให้ Refresh รูปเองทุก 30 วินาที
+    return """
+    <html>
+        <head><title>CCTV Snapshot</title><meta http-equiv="refresh" content="30"></head>
+        <body style="background:#222; color:white; text-align:center;">
+            <h1>CCTV Latest Detection</h1>
+            <img src="/last_image" style="max-width:80%; border:5px solid #00ff00;">
+            <p>Last Update: <span id="time"></span></p>
+            <script>document.getElementById('time').innerHTML = new Date().toLocaleString();</script>
+        </body>
+    </html>
+    """
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(video_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/last_image')
+def last_image():
+    return send_file(last_frame_path, mimetype='image/jpeg')
 
 if __name__ == "__main__":
-    t = threading.Thread(target=ai_worker, daemon=True)
-    t.start()
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    # รัน AI ใน Background
+    threading.Thread(target=detection_job, daemon=True).start()
+    app.run(host='0.0.0.0', port=5000)
