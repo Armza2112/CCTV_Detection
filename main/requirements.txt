@@ -3,4 +3,4 @@ opencv-python
 paho-mqtt
 python-dotenv
 ultralytics
-onnxruntimex
+onnxruntime
