@@ -4,7 +4,7 @@ import time
 import os 
 import numpy as np
 import paho.mqtt.client as mqtt
-from flask import Flask, render_template, Response, send_file
+from flask import Flask, render_template, Response, send_file, make_response
 from dotenv import load_dotenv
 from pathlib import Path
 import onnxruntime as ort
@@ -27,15 +27,13 @@ if isinstance(CAMERA_PORT, str) and CAMERA_PORT.isdigit():
 app = Flask(__name__)
 model_path = base_dir.parent / "train_model" / "best.onnx"
 
-# โหลด Model ครั้งเดียวเก็บไว้ใน RAM
 session = ort.InferenceSession(str(model_path))
 input_name = session.get_inputs()[0].name
 
-# ระบุ Path ไฟล์รูปให้ชัดเจน ป้องกันหาไฟล์ไม่เจอ
 last_frame_path = os.path.join(base_dir, "latest_detect.jpg")
 person_count = 0
 target_status = "OFF"
-CHECK_INTERVAL = 60 # ตรวจสอบทุกๆ 60 วินาที
+CHECK_INTERVAL = 60 
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 
@@ -45,8 +43,7 @@ def mqtt_connect():
             client.username_pw_set(MQTT_USER, MQTT_PASS)
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
         client.loop_start()
-    except:
-        pass
+    except: pass
 
 def mqtt_send(status):
     client.publish(MQTT_TOPIC, json.dumps({"state": status}))
@@ -58,14 +55,11 @@ def detection_job():
     
     while True:
         cap = cv2.VideoCapture(CAMERA_PORT)
-        # ตั้งค่ากล้องให้ถอดรหัลง่ายๆ
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         
         success, frame = cap.read()
         if success:
             h_orig, w_orig = frame.shape[:2]
-            
-            # ประมวลผล AI
             blob = cv2.resize(frame, (640, 640))
             blob = blob.astype(np.float32) / 255.0
             blob = np.transpose(blob, (2, 0, 1))
@@ -81,6 +75,7 @@ def detection_job():
 
             for i in indices:
                 xc, yc, w, h = preds[i][:4]
+                # คำนวณ Scale ให้แม่นยำตามขนาดภาพจริง
                 x1 = int((xc - w/2) * (w_orig / 640))
                 y1 = int((yc - h/2) * (h_orig / 640))
                 nw = int(w * (w_orig / 640))
@@ -91,67 +86,71 @@ def detection_job():
             final_indices = cv2.dnn.NMSBoxes(temp_boxes, confidences, 0.4, 0.5)
             person_count = len(final_indices)
 
-            # วาดกรอบลงในรูป
+            # วาดกรอบลงบนภาพจริง
             if person_count > 0:
                 for i in (final_indices.flatten() if hasattr(final_indices, 'flatten') else final_indices):
                     x, y, w, h = temp_boxes[i]
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             
-            # บันทึกสถานะและส่ง MQTT
             curr_status = "ON" if person_count > 0 else "OFF"
-            cv2.putText(frame, f"Detected: {person_count} | {time.ctime()}", (20, 40), 
+            timestamp_str = time.strftime("%Y-%m-%d %H:%M:%S")
+            cv2.putText(frame, f"Detected: {person_count} | {timestamp_str}", (20, 40), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
-            # เขียนไฟล์แบบปลอดภัย (Atomic Write)
-            temp_file = last_frame_path + ".tmp"
-            cv2.imwrite(temp_file, frame)
-            os.replace(temp_file, last_frame_path)
+            # บันทึกไฟล์แบบไบต์ (แก้ปัญหา OpenCV imwrite)
+            success_enc, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if success_enc:
+                temp_file = last_frame_path + ".tmp"
+                with open(temp_file, "wb") as f:
+                    f.write(buffer.tobytes())
+                os.replace(temp_file, last_frame_path)
 
             if curr_status != target_status:
                 target_status = curr_status
                 mqtt_send(target_status)
 
-            print(f"[{time.ctime()}] AI Check: {person_count} person(s) found. Status: {target_status}")
+            print(f"[{timestamp_str}] AI Check: {person_count} found. Status: {target_status}")
         
-        cap.release() # ปิดกล้องเพื่อประหยัดพลังงานและคืนทรัพยากร
+        cap.release()
         time.sleep(CHECK_INTERVAL)
 
 @app.route('/')
 def index():
-    # หน้าเว็บแบบเรียบง่าย สั่ง Refresh รูปทุก 30 วินาที
-    return """
+    # ใช้ f-string เพื่อใส่ค่าปัจจุบันลงใน HTML โดยตรง
+    return f"""
     <html>
         <head>
             <title>CCTV AI Snapshot</title>
             <meta http-equiv="refresh" content="30">
             <style>
-                body { background: #1a1a1a; color: white; text-align: center; font-family: sans-serif; }
-                img { max-width: 90%; border: 4px solid #444; border-radius: 8px; margin-top: 20px; }
-                .status { font-size: 24px; color: #00ff00; }
+                body {{ background: #1a1a1a; color: white; text-align: center; font-family: sans-serif; padding-top: 50px; }}
+                img {{ max-width: 90%; border: 4px solid #00ff00; border-radius: 10px; box-shadow: 0 0 20px rgba(0,255,0,0.2); }}
+                .info {{ font-size: 24px; color: #00ff00; margin-bottom: 20px; }}
+                .time {{ color: #888; margin-top: 10px; }}
             </style>
         </head>
         <body>
-            <h1>CCTV AI Snapshot (Every 1 Min)</h1>
-            <div class="status">Current Status: {{ status }}</div>
-            <img src="/last_image?t={{ time }}">
-            <p>Last Update: {{ last_time }}</p>
+            <h1>Office Monitoring (Snapshot Mode)</h1>
+            <div class="info">Current Status: {target_status} | People Count: {person_count}</div>
+            <img src="/last_image?t={time.time()}">
+            <div class="time">Last AI Scan: {time.ctime()}</div>
         </body>
     </html>
-    """.replace('{{ status }}', target_status).replace('{{ last_time }}', time.ctime()).replace('{{ time }}', str(time.time()))
+    """
 
 @app.route('/last_image')
 def last_image():
-    # ถ้ายังไม่มีไฟล์รูป ให้ส่งรูปว่างๆ ไปก่อน ป้องกัน Error 500
     if not os.path.exists(last_frame_path):
         blank_img = np.zeros((480, 640, 3), dtype=np.uint8)
         cv2.putText(blank_img, "AI Initializing...", (180, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         _, buffer = cv2.imencode('.jpg', blank_img)
         return Response(buffer.tobytes(), mimetype='image/jpeg')
     
-    return send_file(last_frame_path, mimetype='image/jpeg')
+    # ส่งไฟล์และตั้งค่า Header ห้าม Cache
+    response = make_response(send_file(last_frame_path, mimetype='image/jpeg'))
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    return response
 
 if __name__ == "__main__":
-    # เริ่มระบบตรวจจับใน Thread แยก
     threading.Thread(target=detection_job, daemon=True).start()
-    # รัน Flask Web Server
     app.run(host='0.0.0.0', port=5000, debug=False)
