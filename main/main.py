@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 import onnxruntime as ort
 import threading
+from collections import deque
 
 base_dir = Path(__file__).resolve().parent
 env_path = base_dir / ".env"
@@ -30,9 +31,8 @@ model_path = base_dir.parent / "train_model" / "best.onnx"
 session = ort.InferenceSession(str(model_path))
 input_name = session.get_inputs()[0].name
 
-# Global variables สำหรับแชร์ข้อมูลระหว่าง Thread
-current_frame = None
-output_frame = None
+# ใช้ Deque เก็บเฟรมล่าสุดเพียงเฟรมเดียว (Maxlen=1) เพื่อความลื่นไหล
+frame_queue = deque(maxlen=1)
 detected_boxes = []
 person_count = 0
 target_status = "OFF"
@@ -52,41 +52,49 @@ def mqtt_send(status):
 
 mqtt_connect()
 
-def ai_thread():
-    global detected_boxes, person_count, target_status, current_frame
+def ai_worker():
+    global detected_boxes, person_count, target_status
     last_status = None
     last_seen_time = 0
     off_delay = 5
 
     while True:
-        if current_frame is not None:
-            img_frame = current_frame.copy()
-            h_orig, w_orig = img_frame.shape[:2]
+        if len(frame_queue) > 0:
+            frame = frame_queue[0].copy()
+            h_orig, w_orig = frame.shape[:2]
             
-            # รัน AI ทุกๆ 0.1 - 0.2 วินาที (ไม่ให้ CPU ร้อนจัด)
-            img = cv2.resize(img_frame, (640, 640))
-            img = img.astype(np.float32) / 255.0
-            img = np.transpose(img, (2, 0, 1))
-            img = np.expand_dims(img, axis=0)
+            blob = cv2.resize(frame, (640, 640))
+            blob = blob.astype(np.float32) / 255.0
+            blob = np.transpose(blob, (2, 0, 1))
+            blob = np.expand_dims(blob, axis=0)
 
-            outputs = session.run(None, {input_name: img})
+            outputs = session.run(None, {input_name: blob})
             preds = np.squeeze(outputs).T
             
-            new_boxes = []
+            temp_boxes = []
+            confidences = []
             scores = preds[:, 4:]
             max_scores = np.max(scores, axis=1)
             
-            indices = np.where(max_scores > 0.4)[0]
-            for i in indices:
+            indices_raw = np.where(max_scores > 0.4)[0]
+            for i in indices_raw:
                 xc, yc, w, h = preds[i][:4]
                 x1 = int((xc - w/2) * (w_orig / 640))
                 y1 = int((yc - h/2) * (h_orig / 640))
                 nw = int(w * (w_orig / 640))
                 nh = int(h * (h_orig / 640))
-                new_boxes.append([x1, y1, nw, nh])
+                temp_boxes.append([x1, y1, nw, nh])
+                confidences.append(float(max_scores[i]))
             
-            detected_boxes = new_boxes
-            person_count = len(new_boxes)
+            final_indices = cv2.dnn.NMSBoxes(temp_boxes, confidences, 0.4, 0.5)
+            
+            final_boxes = []
+            if len(final_indices) > 0:
+                for i in final_indices.flatten() if hasattr(final_indices, 'flatten') else final_indices:
+                    final_boxes.append(temp_boxes[i])
+            
+            detected_boxes = final_boxes
+            person_count = len(final_boxes)
 
             curr_time = time.time()
             if person_count > 0:
@@ -98,30 +106,33 @@ def ai_thread():
             if target_status != last_status:
                 mqtt_send(target_status)
                 last_status = target_status
-            
-        time.sleep(0.1) # ปรับค่านี้เพื่อคุมความเร็ว AI
+        
+        time.sleep(0.05) # รัน AI ประมาณ 20 ครั้งต่อวินาที
 
-def generate_frames():
-    global current_frame, detected_boxes, person_count, target_status
+def video_stream():
     cap = cv2.VideoCapture(CAMERA_PORT)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # ลด Buffer ของ OpenCV
 
     while cap.isOpened():
         success, frame = cap.read()
         if not success: break
         
-        current_frame = frame # ส่งเฟรมไปให้ AI Thread
+        frame_queue.append(frame) # ส่งภาพเข้าคิว AI
         
         # วาดกรอบจากข้อมูลล่าสุดที่มี
         for box in detected_boxes:
             x, y, w, h = box
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        cv2.putText(frame, f"People: {person_count}  Status: {target_status}", (20, 40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, f"People: {person_count} | Status: {target_status}", (20, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        # บีบอัดภาพเพื่อความเร็วสูงสุดในการสตรีม
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not ret: continue
+        
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
@@ -131,10 +142,10 @@ def index():
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(video_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == "__main__":
-    # เริ่มต้น AI Thread แยกต่างหาก
-    t = threading.Thread(target=ai_thread, daemon=True)
+    t = threading.Thread(target=ai_worker, daemon=True)
     t.start()
+    # ปิด Debug mode เพื่อเพิ่มประสิทธิภาพ
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
