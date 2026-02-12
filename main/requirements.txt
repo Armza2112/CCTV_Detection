@@ -1,6 +1,6 @@
-ultralytics
+flask
 opencv-python
 paho-mqtt
 python-dotenv
 ultralytics
-flask
+onnxruntimex

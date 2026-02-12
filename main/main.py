@@ -23,10 +23,14 @@ CAMERA_PORT = os.getenv("CAMERA_PORT")
 if CAMERA_PORT and CAMERA_PORT.isdigit():
     CAMERA_PORT = int(CAMERA_PORT)
 
-# --- Initialize ---
 app = Flask(__name__)
-# model = YOLO("yolov8n.pt")
-model = YOLO(r"C:\Users\cheew\Desktop\Swift\CCTV_Detected\train_model\best.pt")
+model_path = base_dir.parent / "train_model" / "best.onnx"
+
+if not model_path.exists():
+    model_path = base_dir.parent / "train_model" / "best.pt"
+
+print(f"Loading model from: {model_path}")
+model = YOLO(str(model_path))
 
 # --- MQTT Setup ---
 # client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -48,7 +52,6 @@ model = YOLO(r"C:\Users\cheew\Desktop\Swift\CCTV_Detected\train_model\best.pt")
 
 # mqtt_connect()
 
-# --- Logic สำหรับส่งภาพขึ้นเว็บ ---
 def generate_frames():
     cap = cv2.VideoCapture(CAMERA_PORT)
     time.sleep(1)
@@ -64,15 +67,13 @@ def generate_frames():
             cap = cv2.VideoCapture(CAMERA_PORT)
             continue
 
-
-        # 1. Detection
         results = model.predict(frame, classes=0, conf=0.4, verbose=False)
         person_count = len(results[0].boxes)
         
-        # 2. ตีกรอบอัตโนมัติ (Bounding Boxes)
+
         annotated_frame = results[0].plot()
 
-        # 3. Status & MQTT Logic
+
         current_time = time.time()
         if person_count > 0:
             last_seen_time = current_time
@@ -83,19 +84,19 @@ def generate_frames():
             else:
                 target_status = "ON"
 
-        # ส่ง MQTT เมื่อสถานะเปลี่ยนเท่านั้น
+
         # nonlocal last_status
         # if target_status != last_status:
         #     mqtt_send(target_status)
         #     last_status = target_status
 
-        # 4. ตกแต่งภาพก่อนโชว์บนเว็บ
+
         cv2.putText(annotated_frame, f"People Count: {person_count}", (20, 50), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
         cv2.putText(annotated_frame, f"Status: {target_status}", (20, 90), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
-        # 5. Encode เป็น JPEG สำหรับ Streaming
+
         ret, buffer = cv2.imencode('.jpg', annotated_frame)
         if not ret:
             continue
@@ -104,7 +105,7 @@ def generate_frames():
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
-# --- Web Routes ---
+
 @app.route('/')
 def index():
     return render_template('index.html')
