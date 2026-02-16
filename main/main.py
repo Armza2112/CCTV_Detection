@@ -8,32 +8,38 @@ from threading import Thread, Lock
 from dotenv import load_dotenv
 from pathlib import Path
 
-# --- บังคับใช้ TCP เพื่อป้องกันภาพแตก/ฉีก จาก Packet Loss ---
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-
+# --- Setup ---
 base_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=base_dir / ".env")
 raw_port = os.getenv("CAMERA_PORT", "0")
-CAMERA_PORT = int(raw_port) if raw_port.isdigit() else raw_port
+RTSP_URL = raw_port # สมมติว่าเป็น rtsp://...
 
 # --- NCNN Setup ---
 model_path = base_dir.parent / "train_model" / "best_ncnn_model"
 net = ncnn.Net()
-net.opt.num_threads = 2
+net.opt.num_threads = 4
 net.load_param(str(model_path / "model.ncnn.param"))
 net.load_model(str(model_path / "model.ncnn.bin"))
 
 app = Flask(__name__)
 
-class AI_CCTV:
-    def __init__(self, src):
-        # ใช้ CAP_FFMPEG เพื่อดึงภาพแบบเสถียร
-        self.cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+class GStreamerCCTV:
+    def __init__(self, url):
+        # GStreamer Pipeline: ใช้ 'rtspsrc' และ 'omxh264dec' (หรือ v4l2h264dec) เพื่อถอดรหัสด้วย Hardware
+        self.pipeline = (
+            f'rtspsrc location={url} latency=100 ! '
+            'rtph264depay ! h264parse ! v4l2h264dec ! '
+            'videoconvert ! video/x-raw, format=BGR ! appsink drop=True'
+        )
+        
+        # ถ้าเป็นกล้อง USB ให้ใช้ pipeline นี้แทน:
+        # self.pipeline = 'v4l2src device=/dev/video0 ! videoconvert ! video/x-raw, format=BGR ! appsink drop=True'
+
+        self.cap = cv2.VideoCapture(self.pipeline, cv2.CAP_GSTREAMER)
         self.frame = None
-        self.latest_detections = []
-        self.running = True
+        self.latest_dets = []
         self.lock = Lock()
+        self.running = True
         self.status = "OFF"
         self.last_seen = 0
 
@@ -43,31 +49,15 @@ class AI_CCTV:
         return self
 
     def _reader(self):
-            print("📸 Camera Thread Started...")
-            while self.running:
-                # 1. เช็คว่ากล้องยังเชื่อมต่ออยู่ไหม
-                if not self.cap.isOpened():
-                    print("❌ Camera connection lost! Reconnecting...")
-                    time.sleep(2)
-                    continue
-
-                # 2. เทคนิค Clear Buffer: อ่านเฟรมที่ค้างอยู่ออกมาให้หมดจนถึงเฟรมล่าสุด
-                # เราใช้ grab() เพื่อข้ามเฟรมเก่าๆ อย่างรวดเร็ว
-                for _ in range(5): # อ่านทิ้งสูงสุด 5 เฟรมต่อรอบ เพื่อไม่ให้ติดลูปตาย
-                    self.cap.grab()
-
-                # 3. อ่านเฟรมปัจจุบันมาใช้งาน
-                success, frame = self.cap.read()
-                
-                if success:
-                    # ลดความละเอียดเพื่อลดภาระ CPU
-                    temp_frame = cv2.resize(frame, (640, 480))
-                    with self.lock:
-                        self.frame = temp_frame
-                else:
-                    # ถ้าอ่านไม่ได้ ให้พักแป๊บนึงแล้วลองใหม่
-                    print("⚠️ Failed to grab frame")
-                    time.sleep(0.1)
+        while self.running:
+            success, frame = self.cap.read()
+            if success:
+                # Resize ทันทีเพื่อลดภาระ
+                temp = cv2.resize(frame, (640, 480))
+                with self.lock:
+                    self.frame = temp
+            else:
+                time.sleep(0.01)
 
     def _inference(self):
         while self.running:
@@ -78,90 +68,62 @@ class AI_CCTV:
             with self.lock:
                 img = self.frame.copy()
             
-            h, w = img.shape[:2]
-            mat_in = ncnn.Mat.from_pixels_resize(img, ncnn.Mat.PixelType.PIXEL_BGR2RGB, w, h, 320, 320)
+            # รัน AI (320x320)
+            mat_in = ncnn.Mat.from_pixels_resize(img, ncnn.Mat.PixelType.PIXEL_BGR2RGB, 640, 480, 320, 320)
             mat_in.substract_mean_normalize([], [1/255.0, 1/255.0, 1/255.0])
             
             ex = net.create_extractor()
             ex.input("in0", mat_in)
-            ret, mat_out = ex.extract("out0")
+            _, mat_out = ex.extract("out0")
             
-            detections = self.wrap_detection(mat_out, 0.4, w, h)
+            # Post-process (Logic เดิมที่คุณมี)
+            feat = np.array(mat_out)
+            if len(feat.shape) == 3: feat = feat[0].T
+            elif len(feat.shape) == 1: feat = feat.reshape(-1, 6)
+            
+            current_dets = []
+            for i in range(feat.shape[0]):
+                conf = feat[i, 1] if feat.shape[1] == 6 else np.max(feat[i, 4:])
+                if conf > 0.4:
+                    cls = int(feat[i, 0]) if feat.shape[1] == 6 else np.argmax(feat[i, 4:])
+                    if cls == 0: # Person
+                        current_dets.append({"box": feat[i, 2:6] if feat.shape[1] == 6 else feat[i, 0:4], "conf": conf})
+            
             with self.lock:
-                self.latest_detections = detections
-                if len([d for d in detections if d["class"] == 0]) > 0:
+                self.latest_dets = current_dets
+                if len(current_dets) > 0:
                     self.status = "ON"
                     self.last_seen = time.time()
                 elif time.time() - self.last_seen > 5:
                     self.status = "OFF"
 
-    def wrap_detection(self, mat_out, conf_threshold, img_w, img_h):
-        feat = np.array(mat_out)
-        if len(feat.shape) == 3: feat = feat[0].T
-        elif len(feat.shape) == 2 and feat.shape[0] < feat.shape[1]: feat = feat.T
-        elif len(feat.shape) == 1: 
-            try: feat = feat.reshape(-1, 6)
-            except: return []
-
-        boxes, confs, ids = [], [], []
-        for i in range(feat.shape[0]):
-            if feat.shape[1] == 6:
-                if feat[i, 1] > conf_threshold:
-                    x1, y1, x2, y2 = feat[i, 2:6]
-                    boxes.append([int(x1*(img_w/320)), int(y1*(img_h/320)), int((x2-x1)*(img_w/320)), int((y2-y1)*(img_h/320))])
-                    confs.append(float(feat[i, 1]))
-                    ids.append(int(feat[i, 0]))
-            else:
-                scores = feat[i, 4:]
-                conf = np.max(scores)
-                if conf > conf_threshold:
-                    cx, cy, w, h = feat[i, 0:4]
-                    boxes.append([int((cx-w/2)*(img_w/320)), int((cy-h/2)*(img_h/320)), int(w*(img_w/320)), int(h*(img_h/320))])
-                    confs.append(float(conf))
-                    ids.append(np.argmax(scores))
-
-        indices = cv2.dnn.NMSBoxes(boxes, confs, conf_threshold, 0.45)
-        return [{"box": boxes[i], "conf": confs[i], "class": ids[i]} for i in indices.flatten()] if len(indices) > 0 else []
-
-    def get_frame_stream(self):
-        desired_fps = 25
-        frame_time = 1.0 / desired_fps
-        
+    def get_stream(self):
         while self.running:
-            start_time = time.time()
             if self.frame is None: continue
             
             with self.lock:
-                # ใช้ .copy() ภายใน Lock เพื่อป้องกันการเข้าถึง Memory ซ้อนกันจนภาพฉีก
-                display_frame = self.frame.copy()
-                dets = self.latest_detections
-                status = self.status
+                draw_frame = self.frame.copy()
+                dets = self.latest_dets
+                st = self.status
 
-            # ไม่ต้องหาร Scale เพราะเรา Resize ตั้งแต่ _reader แล้ว (แม่นยำกว่า)
-            for det in dets:
-                if det["class"] == 0:
-                    x, y, w, h = det["box"]
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.putText(display_frame, f"P {det['conf']:.2f}", (x, y - 5), 0, 0.5, (0, 255, 0), 1)
+            for d in dets:
+                x, y, w, h = [int(v * 2) for v in d["box"]] # Scale 320->640
+                cv2.rectangle(draw_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
-            cv2.putText(display_frame, f"ST: {status}", (15, 30), 0, 0.6, (0, 255, 0), 2)
+            cv2.putText(draw_frame, f"GStreamer HW Decode - {st}", (20, 40), 0, 0.6, (0, 255, 0), 2)
             
-            _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _, buffer = cv2.imencode('.jpg', draw_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            
-            elapsed = time.time() - start_time
-            if frame_time > elapsed:
-                time.sleep(frame_time - elapsed)
 
-cctv = AI_CCTV(CAMERA_PORT).start()
+cctv = GStreamerCCTV(RTSP_URL).start()
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(cctv.get_frame_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(cctv.get_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/')
 def index():
-    return "<html><body style='background:#000;text-align:center;'><img src='/video_feed' style='width:90%;'></body></html>"
+    return "<html><body style='margin:0;background:#000;text-align:center;'><img src='/video_feed' style='height:100vh;'></body></html>"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000, threaded=True)
