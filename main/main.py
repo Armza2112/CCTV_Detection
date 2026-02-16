@@ -8,16 +8,18 @@ from threading import Thread, Lock
 from dotenv import load_dotenv
 from pathlib import Path
 
-# --- Setup ---
+# --- บังคับใช้ TCP เพื่อป้องกันภาพแตก/ฉีก จาก Packet Loss ---
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
 base_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=base_dir / ".env")
 raw_port = os.getenv("CAMERA_PORT", "0")
 CAMERA_PORT = int(raw_port) if raw_port.isdigit() else raw_port
 
-# --- Optimized NCNN ---
+# --- NCNN Setup ---
 model_path = base_dir.parent / "train_model" / "best_ncnn_model"
 net = ncnn.Net()
-net.opt.num_threads = 2 # ใช้ 2 เพื่อไม่ให้ CPU ร้อนจัดจนลด Clock เอง (Throttle)
+net.opt.num_threads = 2
 net.load_param(str(model_path / "model.ncnn.param"))
 net.load_model(str(model_path / "model.ncnn.bin"))
 
@@ -25,8 +27,9 @@ app = Flask(__name__)
 
 class AI_CCTV:
     def __init__(self, src):
-        self.cap = cv2.VideoCapture(src)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # ใช้ CAP_FFMPEG เพื่อดึงภาพแบบเสถียร
+        self.cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
         self.frame = None
         self.latest_detections = []
         self.running = True
@@ -35,9 +38,7 @@ class AI_CCTV:
         self.last_seen = 0
 
     def start(self):
-        # Thread อ่านกล้อง (เน้นเร็ว)
         Thread(target=self._reader, daemon=True).start()
-        # Thread รัน AI (รันแยกกัน ไม่รอหน้าจอ)
         Thread(target=self._inference, daemon=True).start()
         return self
 
@@ -45,8 +46,10 @@ class AI_CCTV:
         while self.running:
             success, frame = self.cap.read()
             if success:
+                # ลดขนาดที่ต้นทางเพื่อให้ AI และการแสดงผลใช้พิกัดเดียวกัน
+                temp_frame = cv2.resize(frame, (640, 480))
                 with self.lock:
-                    self.frame = frame
+                    self.frame = temp_frame
             else:
                 time.sleep(0.01)
 
@@ -56,7 +59,6 @@ class AI_CCTV:
                 time.sleep(0.01)
                 continue
             
-            # ดึงภาพปัจจุบันไปรัน AI
             with self.lock:
                 img = self.frame.copy()
             
@@ -68,7 +70,6 @@ class AI_CCTV:
             ex.input("in0", mat_in)
             ret, mat_out = ex.extract("out0")
             
-            # อัปเดตผลตรวจจับ
             detections = self.wrap_detection(mat_out, 0.4, w, h)
             with self.lock:
                 self.latest_detections = detections
@@ -79,7 +80,6 @@ class AI_CCTV:
                     self.status = "OFF"
 
     def wrap_detection(self, mat_out, conf_threshold, img_w, img_h):
-        # (ใช้ Logic เดิมที่แม่นยำอยู่แล้ว)
         feat = np.array(mat_out)
         if len(feat.shape) == 3: feat = feat[0].T
         elif len(feat.shape) == 2 and feat.shape[0] < feat.shape[1]: feat = feat.T
@@ -106,50 +106,37 @@ class AI_CCTV:
 
         indices = cv2.dnn.NMSBoxes(boxes, confs, conf_threshold, 0.45)
         return [{"box": boxes[i], "conf": confs[i], "class": ids[i]} for i in indices.flatten()] if len(indices) > 0 else []
+
     def get_frame_stream(self):
-            # กำหนดความเร็วในการส่ง (25 FPS กำลังดีสำหรับงาน CCTV)
-            desired_fps = 25
-            frame_time = 1.0 / desired_fps
+        desired_fps = 25
+        frame_time = 1.0 / desired_fps
+        
+        while self.running:
+            start_time = time.time()
+            if self.frame is None: continue
             
-            while self.running:
-                start_time = time.time()
-                if self.frame is None: continue
-                
-                with self.lock:
-                    # 1. ลด Resolution ตอนส่งออกหน้าเว็บ (ช่วยให้ภาพไม่แตกเวลาคนขยับ)
-                    # 480x360 เป็นขนาดที่ประหยัด Bandwidth มากแต่ยังดูรู้เรื่อง
-                    display_frame = cv2.resize(self.frame, (640, 480))
-                    dets = self.latest_detections
-                    status = self.status
+            with self.lock:
+                # ใช้ .copy() ภายใน Lock เพื่อป้องกันการเข้าถึง Memory ซ้อนกันจนภาพฉีก
+                display_frame = self.frame.copy()
+                dets = self.latest_detections
+                status = self.status
 
-                # 2. คำนวณ Scale ของกรอบ (เพราะเราลดขนาดภาพจาก 640 เป็น 480)
-                # Scale = 480 / 640 = 0.75
-                scale = 0.75
+            # ไม่ต้องหาร Scale เพราะเรา Resize ตั้งแต่ _reader แล้ว (แม่นยำกว่า)
+            for det in dets:
+                if det["class"] == 0:
+                    x, y, w, h = det["box"]
+                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.putText(display_frame, f"P {det['conf']:.2f}", (x, y - 5), 0, 0.5, (0, 255, 0), 1)
 
-                # วาดผลลัพธ์
-                for det in dets:
-                    if det["class"] == 0: # ตรวจจับคน
-                        x, y, w, h = det["box"]
-                        # ปรับขนาดพิกัดกรอบตามภาพที่เล็กลง
-                        nx, ny = int(x * scale), int(y * scale)
-                        nw, nh = int(w * scale), int(h * scale)
-                        
-                        cv2.rectangle(display_frame, (nx, ny), (nx + nw, ny + nh), (0, 255, 0), 2)
-                        cv2.putText(display_frame, f"P {det['conf']:.2f}", (nx, ny - 5), 
-                                    0, 0.5, (0, 255, 0), 1)
+            cv2.putText(display_frame, f"ST: {status}", (15, 30), 0, 0.6, (0, 255, 0), 2)
+            
+            _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            
+            elapsed = time.time() - start_time
+            if frame_time > elapsed:
+                time.sleep(frame_time - elapsed)
 
-                cv2.putText(display_frame, f"ST: {status}", (15, 30), 0, 0.6, (0, 255, 0), 2)
-                
-                # 3. บีบอัดด้วยคุณภาพ 80% (สมดุลที่สุด ภาพไม่เป็นวุ้นและไม่หนักเกินไป)
-                _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                
-                # 4. คุม FPS ไม่ให้ส่งเร็วเกินจน Network คอขวด
-                elapsed = time.time() - start_time
-                sleep_time = frame_time - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
 cctv = AI_CCTV(CAMERA_PORT).start()
 
 @app.route('/video_feed')
