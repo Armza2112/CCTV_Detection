@@ -106,28 +106,50 @@ class AI_CCTV:
 
         indices = cv2.dnn.NMSBoxes(boxes, confs, conf_threshold, 0.45)
         return [{"box": boxes[i], "conf": confs[i], "class": ids[i]} for i in indices.flatten()] if len(indices) > 0 else []
-
     def get_frame_stream(self):
-        while self.running:
-            if self.frame is None: continue
+            # กำหนดความเร็วในการส่ง (25 FPS กำลังดีสำหรับงาน CCTV)
+            desired_fps = 25
+            frame_time = 1.0 / desired_fps
             
-            with self.lock:
-                display_frame = self.frame.copy()
-                dets = self.latest_detections
-                status = self.status
+            while self.running:
+                start_time = time.time()
+                if self.frame is None: continue
+                
+                with self.lock:
+                    # 1. ลด Resolution ตอนส่งออกหน้าเว็บ (ช่วยให้ภาพไม่แตกเวลาคนขยับ)
+                    # 480x360 เป็นขนาดที่ประหยัด Bandwidth มากแต่ยังดูรู้เรื่อง
+                    display_frame = cv2.resize(self.frame, (640, 480))
+                    dets = self.latest_detections
+                    status = self.status
 
-            # วาดผลลัพธ์ (เบามาก ไม่กินแรง)
-            for det in dets:
-                if det["class"] == 0:
-                    x, y, w, h = det["box"]
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                # 2. คำนวณ Scale ของกรอบ (เพราะเราลดขนาดภาพจาก 640 เป็น 480)
+                # Scale = 480 / 640 = 0.75
+                scale = 0.75
 
-            cv2.putText(display_frame, f"STATUS: {status}", (20, 40), 0, 0.7, (0, 255, 0), 2)
-            
-            # บีบอัดภาพเพื่อส่งผ่านหน้าเว็บ (ใช้ความเร็วสูงสุด)
-            _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                # วาดผลลัพธ์
+                for det in dets:
+                    if det["class"] == 0: # ตรวจจับคน
+                        x, y, w, h = det["box"]
+                        # ปรับขนาดพิกัดกรอบตามภาพที่เล็กลง
+                        nx, ny = int(x * scale), int(y * scale)
+                        nw, nh = int(w * scale), int(h * scale)
+                        
+                        cv2.rectangle(display_frame, (nx, ny), (nx + nw, ny + nh), (0, 255, 0), 2)
+                        cv2.putText(display_frame, f"P {det['conf']:.2f}", (nx, ny - 5), 
+                                    0, 0.5, (0, 255, 0), 1)
 
+                cv2.putText(display_frame, f"ST: {status}", (15, 30), 0, 0.6, (0, 255, 0), 2)
+                
+                # 3. บีบอัดด้วยคุณภาพ 80% (สมดุลที่สุด ภาพไม่เป็นวุ้นและไม่หนักเกินไป)
+                _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                
+                # 4. คุม FPS ไม่ให้ส่งเร็วเกินจน Network คอขวด
+                elapsed = time.time() - start_time
+                sleep_time = frame_time - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
 cctv = AI_CCTV(CAMERA_PORT).start()
 
 @app.route('/video_feed')
