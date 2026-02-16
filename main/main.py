@@ -43,15 +43,26 @@ class AI_CCTV:
         return self
 
     def _reader(self):
-        while self.running:
-            success, frame = self.cap.read()
-            if success:
-                # ลดขนาดที่ต้นทางเพื่อให้ AI และการแสดงผลใช้พิกัดเดียวกัน
-                temp_frame = cv2.resize(frame, (640, 480))
-                with self.lock:
-                    self.frame = temp_frame
-            else:
-                time.sleep(0.01)
+            while self.running:
+                # 1. ดึงภาพออกมาทิ้งจนกว่าจะถึงเฟรมล่าสุด (สำคัญมากในการแก้ Delay)
+                # เราจะไม่ยอมให้มีเฟรมค้างอยู่ใน Buffer เกิน 1 เฟรม
+                while True:
+                    success = self.cap.grab() # grab() เร็วกว่า read() เพราะยังไม่ต้องถอดรหัสภาพ
+                    if not success: break
+                    
+                    # ถ้าไม่มีเฟรมเหลือในคิวแล้ว หรือกล้องส่งมาไม่ทัน ให้หยุด grab
+                    if not self.cap.grab(): 
+                        break
+
+                # 2. อ่านเฟรมล่าสุดจริงๆ ออกมาถอดรหัส
+                success, frame = self.cap.retrieve() 
+                
+                if success:
+                    temp_frame = cv2.resize(frame, (640, 480))
+                    with self.lock:
+                        self.frame = temp_frame
+                else:
+                    time.sleep(0.01)
 
     def _inference(self):
         while self.running:
