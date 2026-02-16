@@ -43,26 +43,31 @@ class AI_CCTV:
         return self
 
     def _reader(self):
+            print("📸 Camera Thread Started...")
             while self.running:
-                # 1. ดึงภาพออกมาทิ้งจนกว่าจะถึงเฟรมล่าสุด (สำคัญมากในการแก้ Delay)
-                # เราจะไม่ยอมให้มีเฟรมค้างอยู่ใน Buffer เกิน 1 เฟรม
-                while True:
-                    success = self.cap.grab() # grab() เร็วกว่า read() เพราะยังไม่ต้องถอดรหัสภาพ
-                    if not success: break
-                    
-                    # ถ้าไม่มีเฟรมเหลือในคิวแล้ว หรือกล้องส่งมาไม่ทัน ให้หยุด grab
-                    if not self.cap.grab(): 
-                        break
+                # 1. เช็คว่ากล้องยังเชื่อมต่ออยู่ไหม
+                if not self.cap.isOpened():
+                    print("❌ Camera connection lost! Reconnecting...")
+                    time.sleep(2)
+                    continue
 
-                # 2. อ่านเฟรมล่าสุดจริงๆ ออกมาถอดรหัส
-                success, frame = self.cap.retrieve() 
+                # 2. เทคนิค Clear Buffer: อ่านเฟรมที่ค้างอยู่ออกมาให้หมดจนถึงเฟรมล่าสุด
+                # เราใช้ grab() เพื่อข้ามเฟรมเก่าๆ อย่างรวดเร็ว
+                for _ in range(5): # อ่านทิ้งสูงสุด 5 เฟรมต่อรอบ เพื่อไม่ให้ติดลูปตาย
+                    self.cap.grab()
+
+                # 3. อ่านเฟรมปัจจุบันมาใช้งาน
+                success, frame = self.cap.read()
                 
                 if success:
+                    # ลดความละเอียดเพื่อลดภาระ CPU
                     temp_frame = cv2.resize(frame, (640, 480))
                     with self.lock:
                         self.frame = temp_frame
                 else:
-                    time.sleep(0.01)
+                    # ถ้าอ่านไม่ได้ ให้พักแป๊บนึงแล้วลองใหม่
+                    print("⚠️ Failed to grab frame")
+                    time.sleep(0.1)
 
     def _inference(self):
         while self.running:
