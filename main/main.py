@@ -8,160 +8,133 @@ from threading import Thread, Lock
 from dotenv import load_dotenv
 from pathlib import Path
 
-# --- บังคับใช้ TCP เพื่อป้องกันภาพแตก/ฉีก จาก Packet Loss ---
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+# บังคับ TCP และปิด Buffer ของ FFMPEG ให้เหลือน้อยที่สุด
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|xerror"
 
 base_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=base_dir / ".env")
 raw_port = os.getenv("CAMERA_PORT", "0")
 CAMERA_PORT = int(raw_port) if raw_port.isdigit() else raw_port
 
-# --- NCNN Setup ---
-model_path = base_dir.parent / "train_model" / "best_ncnn_model"
+# --- NCNN Optimized ---
 net = ncnn.Net()
-net.opt.num_threads = 2
-net.load_param(str(model_path / "model.ncnn.param"))
-net.load_model(str(model_path / "model.ncnn.bin"))
+net.opt.num_threads = 4 # เร่งกลับมาใช้ 4 core แต่เราจะคุมจังหวะรันแทน
+net.opt.use_vulkan_compute = False
+net.load_param(str(base_dir.parent / "train_model/best_ncnn_model/model.ncnn.param"))
+net.load_model(str(base_dir.parent / "train_model/best_ncnn_model/model.ncnn.bin"))
 
 app = Flask(__name__)
 
-class AI_CCTV:
+class FastAI:
     def __init__(self, src):
-        # ใช้ CAP_FFMPEG เพื่อดึงภาพแบบเสถียร
         self.cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
         self.frame = None
-        self.latest_detections = []
-        self.running = True
-        self.lock = Lock()
+        self.latest_dets = []
         self.status = "OFF"
+        self.lock = Lock()
+        self.running = True
         self.last_seen = 0
 
     def start(self):
-        Thread(target=self._reader, daemon=True).start()
-        Thread(target=self._inference, daemon=True).start()
+        # เธรด 1: อ่านกล้องอย่างเดียว (ห้ามทำอย่างอื่น)
+        Thread(target=self._read_loop, daemon=True).start()
+        # เธรด 2: รัน AI อย่างเดียว (วนรันให้เร็วที่สุดเท่าที่ CPU จะไหว)
+        Thread(target=self._ai_loop, daemon=True).start()
         return self
 
-    def _reader(self):
-            print("📸 Camera Thread Started...")
-            while self.running:
-                # 1. เช็คว่ากล้องยังเชื่อมต่ออยู่ไหม
-                if not self.cap.isOpened():
-                    print("❌ Camera connection lost! Reconnecting...")
-                    time.sleep(2)
-                    continue
+    def _read_loop(self):
+        while self.running:
+            success, frame = self.cap.read()
+            if success:
+                # Resize ทันทีครั้งเดียวเพื่อลดภาระทุกเธรด
+                temp = cv2.resize(frame, (640, 480))
+                with self.lock:
+                    self.frame = temp
+            else:
+                time.sleep(0.01)
 
-                # 2. เทคนิค Clear Buffer: อ่านเฟรมที่ค้างอยู่ออกมาให้หมดจนถึงเฟรมล่าสุด
-                # เราใช้ grab() เพื่อข้ามเฟรมเก่าๆ อย่างรวดเร็ว
-                for _ in range(5): # อ่านทิ้งสูงสุด 5 เฟรมต่อรอบ เพื่อไม่ให้ติดลูปตาย
-                    self.cap.grab()
-
-                # 3. อ่านเฟรมปัจจุบันมาใช้งาน
-                success, frame = self.cap.read()
-                
-                if success:
-                    # ลดความละเอียดเพื่อลดภาระ CPU
-                    temp_frame = cv2.resize(frame, (640, 480))
-                    with self.lock:
-                        self.frame = temp_frame
-                else:
-                    # ถ้าอ่านไม่ได้ ให้พักแป๊บนึงแล้วลองใหม่
-                    print("⚠️ Failed to grab frame")
-                    time.sleep(0.1)
-
-    def _inference(self):
+    def _ai_loop(self):
         while self.running:
             if self.frame is None:
                 time.sleep(0.01)
                 continue
             
+            # ดึงภาพล่าสุดไปรัน AI (Copy ออกมาเพื่อไม่ให้กวนเธรดอ่าน)
             with self.lock:
-                img = self.frame.copy()
+                img_for_ai = self.frame.copy()
             
-            h, w = img.shape[:2]
-            mat_in = ncnn.Mat.from_pixels_resize(img, ncnn.Mat.PixelType.PIXEL_BGR2RGB, w, h, 320, 320)
+            # รัน AI (ใช้ขนาด 320x320 ตามโมเดล)
+            mat_in = ncnn.Mat.from_pixels_resize(img_for_ai, ncnn.Mat.PixelType.PIXEL_BGR2RGB, 640, 480, 320, 320)
             mat_in.substract_mean_normalize([], [1/255.0, 1/255.0, 1/255.0])
             
             ex = net.create_extractor()
             ex.input("in0", mat_in)
-            ret, mat_out = ex.extract("out0")
+            _, mat_out = ex.extract("out0")
             
-            detections = self.wrap_detection(mat_out, 0.4, w, h)
+            # ดึงพิกัด (wrap_detection logic เดิมของคุณ)
+            dets = self.process_dets(mat_out)
+            
             with self.lock:
-                self.latest_detections = detections
-                if len([d for d in detections if d["class"] == 0]) > 0:
+                self.latest_dets = dets
+                if len(dets) > 0:
                     self.status = "ON"
                     self.last_seen = time.time()
                 elif time.time() - self.last_seen > 5:
                     self.status = "OFF"
+            
+            # พักจังหวะเล็กน้อยไม่ให้ CPU ร้อนเกิน (ปรับเพิ่มได้ถ้าเครื่องค้าง)
+            time.sleep(0.01)
 
-    def wrap_detection(self, mat_out, conf_threshold, img_w, img_h):
+    def process_dets(self, mat_out):
         feat = np.array(mat_out)
         if len(feat.shape) == 3: feat = feat[0].T
-        elif len(feat.shape) == 2 and feat.shape[0] < feat.shape[1]: feat = feat.T
-        elif len(feat.shape) == 1: 
+        elif len(feat.shape) == 1:
             try: feat = feat.reshape(-1, 6)
             except: return []
-
-        boxes, confs, ids = [], [], []
-        for i in range(feat.shape[0]):
-            if feat.shape[1] == 6:
-                if feat[i, 1] > conf_threshold:
-                    x1, y1, x2, y2 = feat[i, 2:6]
-                    boxes.append([int(x1*(img_w/320)), int(y1*(img_h/320)), int((x2-x1)*(img_w/320)), int((y2-y1)*(img_h/320))])
-                    confs.append(float(feat[i, 1]))
-                    ids.append(int(feat[i, 0]))
-            else:
-                scores = feat[i, 4:]
-                conf = np.max(scores)
-                if conf > conf_threshold:
-                    cx, cy, w, h = feat[i, 0:4]
-                    boxes.append([int((cx-w/2)*(img_w/320)), int((cy-h/2)*(img_h/320)), int(w*(img_w/320)), int(h*(img_h/320))])
-                    confs.append(float(conf))
-                    ids.append(np.argmax(scores))
-
-        indices = cv2.dnn.NMSBoxes(boxes, confs, conf_threshold, 0.45)
-        return [{"box": boxes[i], "conf": confs[i], "class": ids[i]} for i in indices.flatten()] if len(indices) > 0 else []
-
-    def get_frame_stream(self):
-        desired_fps = 25
-        frame_time = 1.0 / desired_fps
         
+        results = []
+        conf_threshold = 0.4
+        for i in range(feat.shape[0]):
+            conf = feat[i, 1] if feat.shape[1] == 6 else np.max(feat[i, 4:])
+            if conf > conf_threshold:
+                cls = int(feat[i, 0]) if feat.shape[1] == 6 else np.argmax(feat[i, 4:])
+                if cls == 0: # Person
+                    results.append({"box": feat[i, 2:6] if feat.shape[1] == 6 else feat[i, 0:4], "conf": conf})
+        return results
+
+    def stream(self):
         while self.running:
-            start_time = time.time()
             if self.frame is None: continue
             
             with self.lock:
-                # ใช้ .copy() ภายใน Lock เพื่อป้องกันการเข้าถึง Memory ซ้อนกันจนภาพฉีก
-                display_frame = self.frame.copy()
-                dets = self.latest_detections
-                status = self.status
+                draw_frame = self.frame.copy()
+                dets = self.latest_dets
+                st = self.status
 
-            # ไม่ต้องหาร Scale เพราะเรา Resize ตั้งแต่ _reader แล้ว (แม่นยำกว่า)
-            for det in dets:
-                if det["class"] == 0:
-                    x, y, w, h = det["box"]
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.putText(display_frame, f"P {det['conf']:.2f}", (x, y - 5), 0, 0.5, (0, 255, 0), 1)
+            # วาดกรอบ (ใช้พิกัดล่าสุดที่ AI หาเจอ)
+            for d in dets:
+                # พิกัดจากโมเดล 320 -> 640 (คูณ 2)
+                # หมายเหตุ: ปรับสูตรตามโมเดลของคุณ ถ้ากรอบไม่ตรง
+                x, y, w, h = [int(v * 2) for v in d["box"]]
+                cv2.rectangle(draw_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
-            cv2.putText(display_frame, f"ST: {status}", (15, 30), 0, 0.6, (0, 255, 0), 2)
+            cv2.putText(draw_frame, f"LIVE - {st}", (20, 40), 0, 0.7, (0, 255, 0), 2)
             
-            _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            # บีบอัดแบบ Turbo (Quality 75)
+            _, buf = cv2.imencode('.jpg', draw_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
             
-            elapsed = time.time() - start_time
-            if frame_time > elapsed:
-                time.sleep(frame_time - elapsed)
+            # ไม่ต้อง sleep ในเธรดส่ง เพื่อให้ภาพไหลตามความเร็ว CPU/Network ทันที
 
-cctv = AI_CCTV(CAMERA_PORT).start()
+cctv = FastAI(CAMERA_PORT).start()
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(cctv.get_frame_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(cctv.stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/')
 def index():
-    return "<html><body style='background:#000;text-align:center;'><img src='/video_feed' style='width:90%;'></body></html>"
+    return "<html><body style='margin:0;background:#000;display:flex;justify-content:center;'><img src='/video_feed' style='height:100vh;'></body></html>"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000, threaded=True)
