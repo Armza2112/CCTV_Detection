@@ -1,6 +1,6 @@
-flask
-opencv-python
-paho-mqtt
-python-dotenv
 ultralytics
-onnxruntime
+opencv-python-headless
+flask
+python-dotenv
+paho-mqtt
+numpy
