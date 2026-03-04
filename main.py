@@ -23,9 +23,14 @@ RTSP_URL = int(raw_port) if raw_port.isdigit() else raw_port
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 # ================= YOLO NCNN =================
-model_path = base_dir / "models" / "best_ncnn_model"
-model = YOLO(str(model_path), task="detect")
+model_path = base_dir / "models" / "best.pt" 
 
+# 2. โหลดโมเดล และระบุ device="cpu" ให้ชัดเจน
+model = YOLO(str(model_path))
+if not (base_dir / "models" / "best_ncnn_model").exists():
+    print("Exporting model to NCNN for the first time on this device...")
+    model.export(format="ncnn")
+model = YOLO(str(base_dir / "models" / "best_ncnn_model"), task="detect")
 # ================= FLASK & SOCKET.IO =================
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')

@@ -1,0 +1,6 @@
+.env
+captures/
+raw_cap/
+__pycache__/
+*.pyc
+.git
