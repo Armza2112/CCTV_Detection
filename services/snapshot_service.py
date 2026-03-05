@@ -3,9 +3,10 @@ import time
 import requests
 import base64
 import json
+import paho.mqtt.client as mqtt
 from config import (
     RTSP_URL, CONF_THRES, INTERVAL_MINUTES,
-    RAW_DIR, CAPTURE_DIR, IMGBB_API_KEY,TB_HOST, TB_ACCESS_TOKEN
+    RAW_DIR, CAPTURE_DIR, IMGBB_API_KEY,TB_HOST, TB_ACCESS_TOKEN, MQTT_BROKER, MQTT_PORT, MQTT_TOPIC
 )
 
 def upload_to_imgbb(image_path):
@@ -20,7 +21,7 @@ def upload_to_imgbb(image_path):
             
             if res_data["status"] == 200:
                 image_url = res_data["data"]["url"]
-                print(f"[INFO] Uploaded to ImgBB: {image_url}")
+                print(f"Uploaded to ImgBB: {image_url}")
                 return image_url
             else:
                 print(f"[ERROR] ImgBB Upload failed: {res_data}")
@@ -28,8 +29,23 @@ def upload_to_imgbb(image_path):
     except Exception as e:
         print(f"[ERROR] Error during upload: {e}")
         return None
+    
+def send_mqtt(switch, state):
+    try:
+        client = mqtt.Client()
+        client.connect(MQTT_BROKER, int(MQTT_PORT), 60)
+        
+        payload = {switch: state}
+        
+        client.publish(MQTT_TOPIC, json.dumps(payload))
+        
+        client.disconnect()
+        print(f"[MQTT] Sent success {switch} : {state}")
+    except Exception as e:
+        print(f"[MQTT] Error: {e}")
 
 def snapshot_job(model, socketio, web_state):
+    last_mqtt_state = None
     while True:
         cap = cv2.VideoCapture(RTSP_URL)
         if not cap.isOpened():
@@ -55,7 +71,7 @@ def snapshot_job(model, socketio, web_state):
                 if int(box.cls == 0):
                     count_person +=1
             
-            print(count_person)
+            print(f"Person {count_person}")
 
             filename = f"detect_{timestamp}.jpg"
             save_path = CAPTURE_DIR / filename
@@ -75,6 +91,16 @@ def snapshot_job(model, socketio, web_state):
                 except Exception as e:
                     print(f"[TB] Error during request: {e}")
 
+            current_state = "ON" if count_person > 0 else "OFF"
+            if MQTT_BROKER and MQTT_PORT:
+                if current_state != last_mqtt_state:
+                    send_mqtt("state_left", current_state)
+                    last_mqtt_state = current_state
+                    # send_mqtt("state_right", "ON")
+                    print(f"State change Current is {current_state}")
+                else:
+                    print("State not change")
+                    
             web_state["latest_img"] = filename
             web_state["last_time"] = time.strftime("%H:%M:%S")
 
