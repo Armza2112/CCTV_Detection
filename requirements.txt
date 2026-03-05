@@ -1,6 +1,13 @@
+
 flask
 flask-socketio
-eventlet
-ultralytics
-opencv-python-headless
+eventlet          
 python-dotenv
+
+numpy<2.0.0
+opencv-python-headless
+ultralytics
+onnx
+ncnn
+
+Pillow>=9.0.0

@@ -1,0 +1,19 @@
+description: Ultralytics YOLO26n model trained on /content/{HOME}/datasets/humandetect-11/data.yaml
+author: Ultralytics
+date: '2026-03-05T11:31:15.958933'
+version: 8.4.19
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: human
+args:
+  batch: 1
+  half: false
+channels: 3
+end2end: false
