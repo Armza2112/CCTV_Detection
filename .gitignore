@@ -4,5 +4,3 @@ __pycache__/
 .env
 collect_data/
 captures
-raw_cap
-models

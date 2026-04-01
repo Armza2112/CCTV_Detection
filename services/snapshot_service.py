@@ -4,9 +4,10 @@ import requests
 import base64
 import json
 import paho.mqtt.client as mqtt
+import numpy as np
 from config import (
     RTSP_URL, CONF_THRES, INTERVAL_MINUTES,
-    RAW_DIR, CAPTURE_DIR, IMGBB_API_KEY,TB_HOST, TB_ACCESS_TOKEN, MQTT_BROKER, MQTT_PORT, MQTT_TOPIC
+    CAPTURE_DIR, IMGBB_API_KEY,TB_HOST, TB_ACCESS_TOKEN, MQTT_BROKER, MQTT_PORT, MQTT_TOPIC
 )
 
 def upload_to_imgbb(image_path):
@@ -46,71 +47,76 @@ def send_mqtt(switch, state):
 
 def snapshot_job(model, socketio, web_state):
     last_mqtt_state = None
+    prev_frame = None
+    
     while True:
         cap = cv2.VideoCapture(RTSP_URL)
         if not cap.isOpened():
-            print("Camera not found (No route to host).")
-            web_state["last_time"] = "Camera Offline (Retrying...)"
-            cap.release() 
+            web_state["last_time"] = "Camera Offline"
             socketio.sleep(10) 
             continue
 
         time.sleep(2)
         ret, frame = cap.read()
+        cap.release()
+        
         if ret:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-
-            raw_file = RAW_DIR / f"raw_{timestamp}.jpg"
-            cv2.imwrite(str(raw_file), frame)
-
-            results = model.predict(frame, conf=CONF_THRES, imgsz=640, verbose=False)
-            annotated = results[0].plot()
-
-            count_person = 0
-            for box in results[0].boxes:
-                if int(box.cls == 0):
-                    count_person +=1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
             
-            print(f"Person {count_person}")
+            motion_detected = False
+            is_first_run = (prev_frame is None)
 
-            filename = f"detect_{timestamp}.jpg"
-            save_path = CAPTURE_DIR / filename
-            cv2.imwrite(str(save_path), annotated)
+            if not is_first_run:
+                frame_delta = cv2.absdiff(prev_frame, gray)
+                thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
+                thresh = cv2.dilate(thresh, None, iterations=2)
+                
+                cv2.imwrite(str(CAPTURE_DIR / "motion_debug.jpg"), thresh)
+                
+                socketio.emit("update_motion", {"time": time.strftime("%H:%M:%S")})
 
-            img_url = upload_to_imgbb(str(save_path))
+                motion_score = np.sum(thresh)
+                if motion_score > 5000: 
+                    motion_detected = True
+                    print(f"[MOTION] Detected! Score: {motion_score}")
 
-            if img_url and TB_ACCESS_TOKEN:
-                try:
-                    tb_url = f"https://{TB_HOST}/api/v1/{TB_ACCESS_TOKEN}/telemetry"
-                    response = requests.post(tb_url, json={"cctv_url": img_url, "count_person" : count_person}, timeout=5)                   
-                    if response.status_code == 200:
-                        print(f"[TB] Success: Link sent to ThingsBoard")
-                    else:
-                        print(f"[TB] Failed: Status Code {response.status_code}, Response: {response.text}")
-                        
-                except Exception as e:
-                    print(f"[TB] Error during request: {e}")
+            prev_frame = gray
 
-            current_state = "ON" if count_person > 0 else "OFF"
-            if MQTT_BROKER and MQTT_PORT:
-                if current_state != last_mqtt_state:
+            if motion_detected or is_first_run:
+                # Predict
+                results = model.predict(frame, conf=CONF_THRES, imgsz=640, verbose=False)
+                annotated = results[0].plot()
+
+                count_person = sum(1 for box in results[0].boxes if int(box.cls) == 0)
+                
+                filename = "latest_detect.jpg" 
+                save_path = CAPTURE_DIR / filename
+                cv2.imwrite(str(save_path), annotated)
+
+                img_url = upload_to_imgbb(str(save_path))
+
+                # ThingsBoard & MQTT 
+                if img_url and TB_ACCESS_TOKEN:
+                    try:
+                        tb_url = f"https://{TB_HOST}/api/v1/{TB_ACCESS_TOKEN}/telemetry"
+                        requests.post(tb_url, json={"cctv_url": img_url, "count_person": count_person}, timeout=5)
+                    except: pass
+
+                current_state = "ON" if count_person > 0 else "OFF"
+                if MQTT_BROKER and current_state != last_mqtt_state:
                     send_mqtt("state_left", current_state)
                     last_mqtt_state = current_state
-                    # send_mqtt("state_right", "ON")
-                    print(f"State change Current is {current_state}")
-                else:
-                    print("State not change")
-                    
-            web_state["latest_img"] = filename
-            web_state["last_time"] = time.strftime("%H:%M:%S")
+                
+                web_state["latest_img"] = filename
+                web_state["last_time"] = time.strftime("%H:%M:%S")
+                socketio.emit("new_detection", {
+                    "img_name": filename,
+                    "time": web_state["last_time"],
+                    "cloud_url": img_url 
+                })
+                print(f"Preson:{count_person}")
+            else:
+                print("No motion detected.")
 
-            socketio.emit("new_detection", {
-                "img_name": filename,
-                "time": web_state["last_time"],
-                "cloud_url": img_url 
-            })
-
-            print(f"Snapshot saved: {filename}")
-
-        cap.release()
         socketio.sleep(INTERVAL_MINUTES * 60)
